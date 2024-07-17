@@ -1,0 +1,2 @@
+[tool.basedpyright]
+reportPrivateImportUsage = false # upstream issue

@@ -1,0 +1,10 @@
+antispam:
+  room:
+    max: 5
+    delay: 60
+  user:
+    max: 5
+    delay: 60
+
+# Gallery thumbnails are inlined by default. Change it to false if you care about shitty clients that can't render inline images and don't mind spam.
+inline_thumbs: true
