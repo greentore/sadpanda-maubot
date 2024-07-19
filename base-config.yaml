@@ -7,6 +7,9 @@ ratelimit:
     per_second: 0.05
     burst_count: 10
 
+# An array of user IDs that are banned from using the bot.
+blacklist: []
+
 # Set it to false to make the bot send gallery thumbnails separately from metadata.
 # Responses to messages linking to more than 2 distinct galleries will inline thumbnails regardless of this setting.
 inline_thumbs: true

@@ -134,6 +134,7 @@ class SadPanda(Plugin):
     api_ratelimit = API_Bucket()
     user_ratelimit: DefaultDict[UserID, UserBucket] = defaultdict(UserBucket)
     room_ratelimit: DefaultDict[RoomID, RoomBucket] = defaultdict(RoomBucket)
+    blacklist: list[str]
     config: BaseProxyConfig  # type:ignore - dunno
 
     @classmethod
@@ -150,6 +151,7 @@ class SadPanda(Plugin):
         UserBucket.burst_count = self.config["ratelimit.user.burst_count"]
         RoomBucket.per_second = self.config["ratelimit.room.per_second"]
         RoomBucket.burst_count = self.config["ratelimit.room.burst_count"]
+        self.blacklist = [self.client.mxid] + self.config["blacklist"]
 
     def ratelimit_ok(
         self, evt: MessageEvent, gallery_count: int, api_req_count: int
@@ -191,7 +193,7 @@ class SadPanda(Plugin):
     async def handler(self, evt: MessageEvent, _match):
         assert isinstance(evt.content, TextMessageEventContent)
         if (
-            evt.sender == self.client.mxid
+            evt.sender in self.blacklist
             or evt.content.msgtype not in self.allowed_msgtypes
             or evt.content.get_edit()
         ):
