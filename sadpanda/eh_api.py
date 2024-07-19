@@ -1,6 +1,8 @@
 import re
 from typing import NamedTuple, TYPE_CHECKING, TypedDict
 
+import aiohttp
+
 if TYPE_CHECKING:
     from .bot import SadPanda
 
@@ -11,15 +13,22 @@ pattern = re.compile(
 EH_API = "https://api.e-hentai.org/api.php"
 
 
-class gid_tuple(NamedTuple):
+class gallery_tuple(NamedTuple):
     gid: int
     token: str
 
 
-class page_gid_tuple(NamedTuple):
+class page_tuple(NamedTuple):
     gid: int
     token: str
     page: int
+
+
+class gid_result(NamedTuple):
+    gid_dict: dict[int, str]
+    """A dict of gids found in the message. Value is an empty string for page links, and token otherwise."""
+    page_list: list[page_tuple]
+    """A list of tuples with page data needed for requesting gallery tokens from the API."""
 
 
 class torrent(TypedDict):
@@ -53,69 +62,79 @@ class gmetadata(TypedDict):
     first_key: str
 
 
-async def _gallery_api(bot: "SadPanda", gid_list: list[gid_tuple]) -> list[gmetadata]:
-    """Query EH API with a list of gid and gallery token tuples to get gallery metadata."""
+timeout = aiohttp.ClientTimeout(total=30)
+
+
+async def gallery_api(
+    bot: "SadPanda", gid_list: list[gallery_tuple]
+) -> list[gmetadata]:
+    """Queries EH API with a list of (gid, gallery_token) tuples to get gallery metadata."""
+
     payload = {"method": "gdata", "gidlist": gid_list, "namespace": 1}
-    async with bot.http.post(EH_API, json=payload) as r:
-        j = await r.json(content_type=None)
-        filtered: list[gmetadata] = []
-        for entry in j["gmetadata"]:
-            if "error" in entry:
-                bot.log.error(f"{entry['gid']} errored with `{entry['error']}`")
-            else:
-                filtered.append(entry)
-        return filtered
+    filtered: list[gmetadata] = []
+    async with bot.http.post(EH_API, json=payload, timeout=timeout) as r:
+        if r.ok:
+            j = await r.json(content_type=None)
+            for entry in j["gmetadata"]:
+                if "error" in entry:
+                    bot.log.error(f"{entry['gid']} errored with `{entry['error']}`")
+                else:
+                    filtered.append(entry)
+
+    return filtered
 
 
 async def _page_api(
-    bot: "SadPanda", page_list: list[page_gid_tuple]
-) -> list[gid_tuple]:
-    """Query EH API with a list of gid, page token and page number tuples to get gallery tokens."""
+    bot: "SadPanda", page_list: list[page_tuple]
+) -> list[gallery_tuple]:
+    """Queries EH API with a list of (gid, page_token, page_number) tuples to get gallery tokens."""
+
     payload = {"method": "gtoken", "pagelist": page_list}
-    async with bot.http.post(EH_API, json=payload) as r:
-        j = await r.json(content_type=None)
-        filtered: list[gid_tuple] = []
-        for entry in j["tokenlist"]:
-            if "error" in entry:
-                bot.log.error(f"{entry['gid']} errored with `{entry['error']}`")
-            else:
-                filtered.append(gid_tuple(entry["gid"], entry["token"]))
-        return filtered
+    filtered: list[gallery_tuple] = []
+    async with bot.http.post(EH_API, json=payload, timeout=timeout) as r:
+        if r.ok:
+            j = await r.json(content_type=None)
+            for entry in j["tokenlist"]:
+                if "error" in entry:
+                    bot.log.error(f"{entry['gid']} errored with `{entry['error']}`")
+                else:
+                    filtered.append(gallery_tuple(entry["gid"], entry["token"]))
+
+    return filtered
 
 
-async def _get_gidlist(bot: "SadPanda", message: str) -> list[gid_tuple]:
-    """Get all gids and tokens in the message."""
-    gallery_dict: dict[int, str | None] = {}
-    page_list: list[page_gid_tuple] = []
-    results = [m.groupdict() for m in pattern.finditer(message)]
-    # EH API allows up to 25 entries per request. More than that seems abusive, so no support.
-    if not results or len(results) > 25:
-        return []
-
-    for r in results:
-        gid = int(r["gid"] or r["gid_p"])
-        token = r["token"] or r["token_p"]
-        page = r["page"]
-        if not page:
-            gallery_dict[gid] = token
-        else:
-            if gid not in gallery_dict:
-                gallery_dict[gid] = None  # Reserving slots to preserve order.
-                page_list.append(page_gid_tuple(gid, token, int(page)))
+async def resolve_page_gids(
+    bot: "SadPanda", gid_dict: dict[int, str], page_list: list[page_tuple]
+) -> list[gallery_tuple]:
+    """Fetches gallery tokens for gids that are missing them and returns a list of (gid, gallery_token) tuples."""
 
     if page_list:
-        # Skip pages we already got gallery tokens for from gallery links.
-        filtered = [p for p in page_list if not gallery_dict.get(p.gid)]
+        filtered = [p for p in page_list if not gid_dict.get(p.gid)]
         if filtered:
             results = await _page_api(bot, filtered)
             for gid, token in results:
-                gallery_dict[gid] = token
+                gid_dict[gid] = token
 
-    return [gid_tuple(gid, token) for gid, token in gallery_dict.items() if token]
+    return [gallery_tuple(gid, token) for gid, token in gid_dict.items() if token]
 
 
-async def get_gallery_meta(bot: "SadPanda", message: str) -> list[gmetadata] | None:
-    """Get gallery metadata for all EH links in the message."""
-    gid_list = await _get_gidlist(bot, message)
-    if gid_list:
-        return await _gallery_api(bot, gid_list)
+def get_gids(message: str) -> gid_result:
+    """Searches the message for EH links and returns gids in a half-assed format to do ratelimiting before firing API calls."""
+
+    gid_dict: dict[int, str] = {}
+    page_list: list[page_tuple] = []
+    results = [m.groupdict() for m in pattern.finditer(message)]
+    # EH API allows up to 25 entries per request. More than that seems abusive, so no support.
+    if len(results) <= 25:
+        for r in results:
+            gid = int(r["gid"] or r["gid_p"])
+            token = r["token"] or r["token_p"]
+            page = r["page"]
+            if not page:
+                gid_dict[gid] = token
+            else:
+                if gid not in gid_dict:
+                    gid_dict[gid] = ""  # Reserving slots to preserve order.
+                    page_list.append(page_tuple(gid, token, int(page)))
+
+    return gid_result(gid_dict, page_list)

@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from io import BytesIO
+from itertools import repeat
 from time import time
 from typing import Awaitable, NamedTuple, cast
 
@@ -19,7 +20,7 @@ from mautrix.types import (
 from mautrix.util.config import BaseProxyConfig
 
 from .config import Config
-from .eh_api import get_gallery_meta, gmetadata
+from .eh_api import gallery_api, get_gids, gmetadata, resolve_page_gids
 
 try:
     from PIL import Image as Pillow
@@ -33,12 +34,8 @@ class Image(NamedTuple):
     info: ImageInfo
 
 
-def create_markdown_url(title: str, url: str):
-    return f"[{title}]({url})"
-
-
-def create_ex_url(gid: int, token: str):
-    return f"https://exhentai.org/g/{gid}/{token}/"
+def create_ex_url(title: str, gid: int, token: str):
+    return f'<a href="https://exhentai.org/g/{gid}/{token}/">{title}</a>'
 
 
 def format_tags(tags: list[str]):
@@ -54,32 +51,35 @@ def format_tags(tags: list[str]):
             tag_dict[namespace] = [tag]
 
     parts = [
-        f'**{namespace}**<br>{", ".join(tags)}' for namespace, tags in tag_dict.items()
+        f'<strong>{namespace}</strong><br>{", ".join(tags)}'
+        for namespace, tags in tag_dict.items()
     ]
     return "<br>".join(parts)
 
 
-def format_lite(galleries: list[gmetadata]) -> str:
-    link_list = [
-        create_markdown_url(g["title"], create_ex_url(g["gid"], g["token"]))
-        for g in galleries
-    ]
-    return "<br>".join(link_list)
-
-
-def format_full(gallery: gmetadata, thumb: Image | None = None):
-    url = create_ex_url(gallery["gid"], gallery["token"])
+def format_msg(gallery: gmetadata, thumb: Image | None = None, collapsed: bool = False):
+    title = create_ex_url(gallery["title"], gallery["gid"], gallery["token"])
+    title_jpn = gallery["title_jpn"]
+    category = gallery["category"]
+    pages = f'{gallery["filecount"]} pages'
+    rating = f'{gallery["rating"]}★'
     timestamp = datetime.fromtimestamp(int(gallery["posted"]), timezone.utc)
-    s = f"""\
-{create_markdown_url(gallery["title"], url)}<br>
-{gallery["title_jpn"]}<br>
-{gallery["category"]} | {gallery["filecount"]} pages | {gallery["rating"]}★ | {timestamp}<br>
-{format_tags(gallery["tags"])}"""
+    tags = format_tags(gallery["tags"])
+    wrapper = ("<details>", "</details>") if collapsed else ("<p>", "</p>")
+    img = (
+        f'<img src="{thumb.url}" title="{thumb.title}" alt="Gallery thumbnail"><br>'
+        if thumb
+        else ""
+    )
+    header = f"<summary>{title}</summary>\n{img}" if collapsed else f"{img}{title}<br>"
 
-    if thumb:
-        return f'<img src="{thumb.url}" title="{thumb.title}" alt="Gallery thumbnail"><br>\n{s}'
-    else:
-        return s
+    return f"""\
+{wrapper[0]}
+{header}
+{title_jpn}<br>
+{category} | {pages} | {rating} | {timestamp}<br>
+{tags}<br>
+{wrapper[1]}"""
 
 
 # Stolen from reactbot.
@@ -90,15 +90,16 @@ class FloodInfo:
     count: int
     last_message: int
 
-    def bump(self) -> bool:
+    def bump(self, count: int = 1) -> bool:
         now = int(time())
         if self.last_message + self.delay < now:
             self.count = 0
-        self.count += 1
-        if self.count > self.max:
+        if self.count + count > self.max:
             return True
-        self.last_message = now
-        return False
+        else:
+            self.last_message = now
+            self.count += count
+            return False
 
 
 class SadPanda(Plugin):
@@ -141,7 +142,7 @@ class SadPanda(Plugin):
             fi = flood_map[key] = self._make_flood_info(for_type)
             return fi
 
-    def is_flood(self, evt: MessageEvent) -> bool:
+    def is_flood(self, evt: MessageEvent, count: int = 1) -> bool:
         return (
             self._get_flood_info(self.user_flood, evt.sender, "user").bump()
             or self._get_flood_info(self.room_flood, evt.room_id, "room").bump()
@@ -162,35 +163,42 @@ class SadPanda(Plugin):
 
     async def process_message(self, evt: MessageEvent):
         """Process EH links in the message and respond with gallery metadata."""
+
         content = cast("TextMessageEventContent", evt.content)
-        galleries = await get_gallery_meta(self, content.body)
+        gid_dict, page_list = get_gids(content.body)
+        count = len(gid_dict)
+        if self.is_flood(evt, count):
+            self.log.warning(f"Flood detected in {evt.room_id}")
+            return
+
+        gid_list = await resolve_page_gids(self, gid_dict, page_list)
+        galleries = await gallery_api(self, gid_list)
         if not galleries:
             return
-        count = len(galleries)
+
         self.log.info(f"Responding with metadata of {count} galleries in {evt.room_id}")
-        if count > 5:  # Titles only if the message has too many links.
-            await evt.respond(format_lite(galleries), allow_html=True)
+
+        tasks: list[Awaitable[Image]] = list()
+        for gallery in galleries:
+            tasks.append(self.get_thumb(gallery))
+
+        thumbs = await asyncio.gather(*tasks)
+        collapsed = repeat(count > 1)
+
+        # Respond to messages with 3+ links in collapsed form with inlined thumbs regardless of setting to prevent spam.
+        if self.config["inline_thumbs"] or count > 2:
+            body = "".join(map(format_msg, galleries, thumbs, collapsed))
+            await evt.respond(body, allow_html=True)
         else:
-            tasks: list[Awaitable[Image]] = list()
-            for gallery in galleries:
-                tasks.append(self.get_thumb(gallery))
-
-            thumbs = await asyncio.gather(*tasks)
-
-            if self.config["inline_thumbs"]:
-                body = "<br><br>".join(map(format_full, galleries, thumbs))
-                await evt.respond(body, allow_html=True)
-            else:
-                for gallery, thumb in zip(galleries, thumbs):
-                    image = MediaMessageEventContent(
-                        body=thumb.title,
-                        url=thumb.url,
-                        info=thumb.info,
-                        msgtype=MessageType.IMAGE,
-                    )
-                    body = format_full(gallery)
-                    await evt.respond(image)
-                    await evt.respond(body, allow_html=True)
+            for gallery, thumb in zip(galleries, thumbs):
+                image = MediaMessageEventContent(
+                    body=thumb.title,
+                    url=thumb.url,
+                    info=thumb.info,
+                    msgtype=MessageType.IMAGE,
+                )
+                await evt.respond(image)
+                await evt.respond(format_msg(gallery), allow_html=True)
 
     @command.passive(r"https?://e[-x]hentai\.org/(?:s|g|mpv)")
     async def handler(self, evt: MessageEvent, _match) -> None:
@@ -199,7 +207,6 @@ class SadPanda(Plugin):
             evt.sender == self.client.mxid
             or evt.content.msgtype not in self.allowed_msgtypes
             or evt.content.get_edit()
-            or self.is_flood(evt)
         ):
             return
 

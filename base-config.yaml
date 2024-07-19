@@ -1,10 +1,12 @@
+# Metadata of how many galleries can be requested before mandatory cooldown.
 antispam:
   room:
-    max: 5
+    max: 10
     delay: 60
   user:
     max: 5
     delay: 60
 
-# Gallery thumbnails are inlined by default. Change it to false if you care about shitty clients that can't render inline images and don't mind spam.
+# Set it to false to make the bot send gallery thumbnails separately from metadata.
+# Responses to messages linking to more than 2 distinct galleries will inline thumbnails regardless of this setting.
 inline_thumbs: true
