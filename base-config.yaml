@@ -1,11 +1,11 @@
-# Metadata of how many galleries can be requested before mandatory cooldown.
-antispam:
+# Metadata of how many galleries can be requested before mandatory cooldown. There's also a hardcoded, global rate limit for API requests.
+ratelimit:
   room:
-    max: 10
-    delay: 60
+    per_second: 0.1
+    burst_count: 10
   user:
-    max: 5
-    delay: 60
+    per_second: 0.05
+    burst_count: 10
 
 # Set it to false to make the bot send gallery thumbnails separately from metadata.
 # Responses to messages linking to more than 2 distinct galleries will inline thumbnails regardless of this setting.

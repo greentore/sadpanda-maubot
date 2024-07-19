@@ -1,11 +1,11 @@
 import asyncio
+from collections import defaultdict
 from datetime import datetime, timezone
 from io import BytesIO
 from itertools import repeat
 from time import time
-from typing import Awaitable, NamedTuple, cast
+from typing import Awaitable, ClassVar, DefaultDict, NamedTuple
 
-from attr import dataclass
 from maubot import MessageEvent, Plugin
 from maubot.handlers import command
 from mautrix.types import (
@@ -32,6 +32,53 @@ class Image(NamedTuple):
     title: str
     url: ContentURI
     info: ImageInfo
+
+
+class Bucket:
+    per_second: ClassVar[float]
+    burst_count: ClassVar[int]
+
+    tokens: int
+    last_update: int
+
+    def __init__(self):
+        self.tokens = self.burst_count
+        self.last_update = int(time())
+
+    def _update_tokens(self) -> None:
+        now = int(time())
+        if self.tokens != self.burst_count:
+            self.tokens = min(
+                self.burst_count,
+                self.tokens + int((now - self.last_update) * self.per_second),
+            )
+        self.last_update = now
+
+    def ok(self, count: int) -> bool:
+        self._update_tokens()
+        if self.tokens >= count:
+            self.tokens -= count
+            return True
+        else:
+            return False
+
+
+# Following load limiting recommendations from https://ehwiki.org/wiki/API
+class API_Bucket(Bucket):
+    per_second = 0.2
+    burst_count = 5
+
+
+class UserBucket(Bucket):
+    pass
+
+
+class RoomBucket(Bucket):
+    pass
+
+
+def pluralize(num: int, str: str):
+    return f'{num} {str}{"s" if num > 1 else ""}'
 
 
 def create_ex_url(title: str, gid: int, token: str):
@@ -61,7 +108,7 @@ def format_msg(gallery: gmetadata, thumb: Image | None = None, collapsed: bool =
     title = create_ex_url(gallery["title"], gallery["gid"], gallery["token"])
     title_jpn = gallery["title_jpn"]
     category = gallery["category"]
-    pages = f'{gallery["filecount"]} pages'
+    pages = pluralize(int(gallery["filecount"]), "page")
     rating = f'{gallery["rating"]}★'
     timestamp = datetime.fromtimestamp(int(gallery["posted"]), timezone.utc)
     tags = format_tags(gallery["tags"])
@@ -78,34 +125,15 @@ def format_msg(gallery: gmetadata, thumb: Image | None = None, collapsed: bool =
 {header}
 {title_jpn}<br>
 {category} | {pages} | {rating} | {timestamp}<br>
-{tags}<br>
+{tags}
 {wrapper[1]}"""
-
-
-# Stolen from reactbot.
-@dataclass
-class FloodInfo:
-    max: int
-    delay: int
-    count: int
-    last_message: int
-
-    def bump(self, count: int = 1) -> bool:
-        now = int(time())
-        if self.last_message + self.delay < now:
-            self.count = 0
-        if self.count + count > self.max:
-            return True
-        else:
-            self.last_message = now
-            self.count += count
-            return False
 
 
 class SadPanda(Plugin):
     allowed_msgtypes: tuple[MessageType, ...] = (MessageType.TEXT, MessageType.EMOTE)
-    user_flood: dict[UserID, FloodInfo]
-    room_flood: dict[RoomID, FloodInfo]
+    api_ratelimit = API_Bucket()
+    user_ratelimit: DefaultDict[UserID, UserBucket] = defaultdict(UserBucket)
+    room_ratelimit: DefaultDict[RoomID, RoomBucket] = defaultdict(RoomBucket)
     config: BaseProxyConfig  # type:ignore - dunno
 
     @classmethod
@@ -114,39 +142,37 @@ class SadPanda(Plugin):
 
     async def start(self) -> None:
         await super().start()
-        self.user_flood = {}
-        self.room_flood = {}
         self.on_external_config_update()
 
     def on_external_config_update(self) -> None:
         self.config.load_and_update()
-        for fi in self.user_flood.values():
-            fi.max = self.config["antispam.user.max"]
-            fi.delay = self.config["antispam.user.delay"]
-        for fi in self.room_flood.values():
-            fi.max = self.config["antispam.room.max"]
-            fi.delay = self.config["antispam.room.delay"]
+        UserBucket.per_second = self.config["ratelimit.user.per_second"]
+        UserBucket.burst_count = self.config["ratelimit.user.burst_count"]
+        RoomBucket.per_second = self.config["ratelimit.room.per_second"]
+        RoomBucket.burst_count = self.config["ratelimit.room.burst_count"]
 
-    def _make_flood_info(self, for_type: str) -> FloodInfo:
-        return FloodInfo(
-            max=self.config[f"antispam.{for_type}.max"],
-            delay=self.config[f"antispam.{for_type}.delay"],
-            count=0,
-            last_message=0,
-        )
+    def ratelimit_ok(
+        self, evt: MessageEvent, gallery_count: int, api_req_count: int
+    ) -> bool:
+        if not self.api_ratelimit.ok(api_req_count):
+            self.log.warning(
+                f"""API rate limit exceeded in {evt.room_id} by {evt.sender}
+{pluralize(api_req_count, "token")} needed, but only {self.api_ratelimit.tokens} remaining"""
+            )
+        elif not self.user_ratelimit[evt.sender].ok(gallery_count):
+            self.log.warning(
+                f"""User rate limit exceeded in {evt.room_id} by {evt.sender}
+{pluralize(gallery_count, "token")} needed, but only {self.user_ratelimit[evt.sender].tokens} remaining"""
+            )
+        elif not self.room_ratelimit[evt.room_id].ok(gallery_count):
+            self.log.warning(
+                f"""Room rate limit exceeded in {evt.room_id} by {evt.sender}
+{pluralize(gallery_count, "token")} needed, but only {self.room_ratelimit[evt.room_id].tokens} remaining"""
+            )
+        else:
+            return True
 
-    def _get_flood_info(self, flood_map: dict, key: str, for_type: str) -> FloodInfo:
-        try:
-            return flood_map[key]
-        except KeyError:
-            fi = flood_map[key] = self._make_flood_info(for_type)
-            return fi
-
-    def is_flood(self, evt: MessageEvent, count: int = 1) -> bool:
-        return (
-            self._get_flood_info(self.user_flood, evt.sender, "user").bump()
-            or self._get_flood_info(self.room_flood, evt.room_id, "room").bump()
-        )
+        return False
 
     async def get_thumb(self, gallery: gmetadata):
         info = ImageInfo()
@@ -161,14 +187,21 @@ class SadPanda(Plugin):
             mxc = await self.client.upload_media(data, info.mimetype)
             return Image(url=mxc, info=info, title=title)
 
-    async def process_message(self, evt: MessageEvent):
-        """Process EH links in the message and respond with gallery metadata."""
+    @command.passive(r"https?://e[-x]hentai\.org/(?:s|g|mpv)")
+    async def handler(self, evt: MessageEvent, _match):
+        assert isinstance(evt.content, TextMessageEventContent)
+        if (
+            evt.sender == self.client.mxid
+            or evt.content.msgtype not in self.allowed_msgtypes
+            or evt.content.get_edit()
+        ):
+            return
 
-        content = cast("TextMessageEventContent", evt.content)
-        gid_dict, page_list = get_gids(content.body)
-        count = len(gid_dict)
-        if self.is_flood(evt, count):
-            self.log.warning(f"Flood detected in {evt.room_id}")
+        evt.content.trim_reply_fallback()
+        gid_dict, page_list = get_gids(evt.content.body)
+        gallery_count = len(gid_dict)
+        api_req_count = 2 if page_list else 1
+        if not self.ratelimit_ok(evt, gallery_count, api_req_count):
             return
 
         gid_list = await resolve_page_gids(self, gid_dict, page_list)
@@ -176,17 +209,19 @@ class SadPanda(Plugin):
         if not galleries:
             return
 
-        self.log.info(f"Responding with metadata of {count} galleries in {evt.room_id}")
+        self.log.info(
+            f"Responding with metadata of {gallery_count} galleries in {evt.room_id}"
+        )
 
         tasks: list[Awaitable[Image]] = list()
         for gallery in galleries:
             tasks.append(self.get_thumb(gallery))
 
         thumbs = await asyncio.gather(*tasks)
-        collapsed = repeat(count > 1)
+        collapsed = repeat(gallery_count > 1)
 
-        # Respond to messages with 3+ links in collapsed form with inlined thumbs regardless of setting to prevent spam.
-        if self.config["inline_thumbs"] or count > 2:
+        # Respond to messages with 3+ galleries in collapsed form with inlined thumbs regardless of setting to prevent spam.
+        if self.config["inline_thumbs"] or gallery_count > 2:
             body = "".join(map(format_msg, galleries, thumbs, collapsed))
             await evt.respond(body, allow_html=True)
         else:
@@ -199,16 +234,3 @@ class SadPanda(Plugin):
                 )
                 await evt.respond(image)
                 await evt.respond(format_msg(gallery), allow_html=True)
-
-    @command.passive(r"https?://e[-x]hentai\.org/(?:s|g|mpv)")
-    async def handler(self, evt: MessageEvent, _match) -> None:
-        assert isinstance(evt.content, TextMessageEventContent)
-        if (
-            evt.sender == self.client.mxid
-            or evt.content.msgtype not in self.allowed_msgtypes
-            or evt.content.get_edit()
-        ):
-            return
-
-        evt.content.trim_reply_fallback()
-        await self.process_message(evt)
