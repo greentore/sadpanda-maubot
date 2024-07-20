@@ -157,23 +157,18 @@ class SadPanda(Plugin):
         self, evt: MessageEvent, gallery_count: int, api_req_count: int
     ) -> bool:
         if not self.api_ratelimit.ok(api_req_count):
-            self.log.warning(
-                f"""API rate limit exceeded in {evt.room_id} by {evt.sender}
-{pluralize(api_req_count, "token")} needed, but only {self.api_ratelimit.tokens} remaining"""
-            )
+            count, tokens = api_req_count, self.api_ratelimit.tokens
         elif not self.user_ratelimit[evt.sender].ok(gallery_count):
-            self.log.warning(
-                f"""User rate limit exceeded in {evt.room_id} by {evt.sender}
-{pluralize(gallery_count, "token")} needed, but only {self.user_ratelimit[evt.sender].tokens} remaining"""
-            )
+            count, tokens = gallery_count, self.user_ratelimit[evt.sender].tokens
         elif not self.room_ratelimit[evt.room_id].ok(gallery_count):
-            self.log.warning(
-                f"""Room rate limit exceeded in {evt.room_id} by {evt.sender}
-{pluralize(gallery_count, "token")} needed, but only {self.room_ratelimit[evt.room_id].tokens} remaining"""
-            )
+            count, tokens = gallery_count, self.room_ratelimit[evt.room_id].tokens
         else:
             return True
 
+        self.log.warning(
+            f"""Room rate limit exceeded in {evt.room_id} by {evt.sender}
+{pluralize(count, "token")} needed, but only {tokens} remaining"""
+        )
         return False
 
     async def get_thumb(self, gallery: gmetadata):
