@@ -10,6 +10,7 @@ from maubot import MessageEvent, Plugin
 from maubot.handlers import command
 from mautrix.types import (
     ContentURI,
+    EventType,
     ImageInfo,
     MediaMessageEventContent,
     MessageType,
@@ -203,11 +204,18 @@ class SadPanda(Plugin):
     @command.passive(r"https?://e[-x]hentai\.org/(?:s|g|mpv)")
     async def handler(self, evt: MessageEvent, _match):
         assert isinstance(evt.content, TextMessageEventContent)
+        assert self.client.state_store
+        can_send = await self.client.state_store.has_power_level(
+            evt.room_id, self.client.mxid, EventType.ROOM_MESSAGE
+        )
         if (
             evt.sender in self.blacklist
             or evt.content.msgtype not in self.allowed_msgtypes
             or evt.content.get_edit()
         ):
+            return
+        if not can_send:
+            self.log.warning(f"Not allowed to send messages in {evt.room_id}")
             return
 
         evt.content.trim_reply_fallback()
