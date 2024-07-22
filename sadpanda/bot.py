@@ -35,8 +35,8 @@ class Image(NamedTuple):
 
 
 class Bucket:
-    per_second: ClassVar[float]
-    burst_count: ClassVar[int]
+    per_second: ClassVar[float] = 0
+    burst_count: ClassVar[int] = 0
 
     tokens: int
     last_update: int
@@ -69,12 +69,15 @@ class API_Bucket(Bucket):
     burst_count = 5
 
 
-class UserBucket(Bucket):
-    pass
+# Rate limit shared among all instances.
+api_ratelimit = API_Bucket()
 
 
-class RoomBucket(Bucket):
-    pass
+def BucketFactory():
+    class BucketSubclass(Bucket):
+        pass
+
+    return BucketSubclass
 
 
 def pluralize(num: int, str: str):
@@ -131,9 +134,10 @@ def format_msg(gallery: gmetadata, thumb: Image | None = None, collapsed: bool =
 
 class SadPanda(Plugin):
     allowed_msgtypes: tuple[MessageType, ...] = (MessageType.TEXT, MessageType.EMOTE)
-    api_ratelimit = API_Bucket()
-    user_ratelimit: DefaultDict[UserID, UserBucket] = defaultdict(UserBucket)
-    room_ratelimit: DefaultDict[RoomID, RoomBucket] = defaultdict(RoomBucket)
+    UserBucket: type[Bucket]
+    RoomBucket: type[Bucket]
+    user_ratelimit: DefaultDict[UserID, Bucket]
+    room_ratelimit: DefaultDict[RoomID, Bucket]
     blacklist: list[str]
     config: BaseProxyConfig  # type:ignore - dunno
 
@@ -143,30 +147,42 @@ class SadPanda(Plugin):
 
     async def start(self) -> None:
         await super().start()
+        self.UserBucket = BucketFactory()
+        self.RoomBucket = BucketFactory()
+        self.user_ratelimit = defaultdict(self.UserBucket)
+        self.room_ratelimit = defaultdict(self.RoomBucket)
         self.on_external_config_update()
 
     def on_external_config_update(self) -> None:
         self.config.load_and_update()
-        UserBucket.per_second = self.config["ratelimit.user.per_second"]
-        UserBucket.burst_count = self.config["ratelimit.user.burst_count"]
-        RoomBucket.per_second = self.config["ratelimit.room.per_second"]
-        RoomBucket.burst_count = self.config["ratelimit.room.burst_count"]
+        self.UserBucket.per_second = self.config["ratelimit.user.per_second"]
+        self.UserBucket.burst_count = self.config["ratelimit.user.burst_count"]
+        self.RoomBucket.per_second = self.config["ratelimit.room.per_second"]
+        self.RoomBucket.burst_count = self.config["ratelimit.room.burst_count"]
         self.blacklist = [self.client.mxid] + self.config["blacklist"]
 
     def ratelimit_ok(
         self, evt: MessageEvent, gallery_count: int, api_req_count: int
     ) -> bool:
-        if not self.api_ratelimit.ok(api_req_count):
-            count, tokens = api_req_count, self.api_ratelimit.tokens
+        if not api_ratelimit.ok(api_req_count):
+            kind, count, tokens = "API", api_req_count, api_ratelimit.tokens
         elif not self.user_ratelimit[evt.sender].ok(gallery_count):
-            count, tokens = gallery_count, self.user_ratelimit[evt.sender].tokens
+            kind, count, tokens = (
+                "User",
+                gallery_count,
+                self.user_ratelimit[evt.sender].tokens,
+            )
         elif not self.room_ratelimit[evt.room_id].ok(gallery_count):
-            count, tokens = gallery_count, self.room_ratelimit[evt.room_id].tokens
+            kind, count, tokens = (
+                "Room",
+                gallery_count,
+                self.room_ratelimit[evt.room_id].tokens,
+            )
         else:
             return True
 
         self.log.warning(
-            f"""Room rate limit exceeded in {evt.room_id} by {evt.sender}
+            f"""{kind} rate limit exceeded in {evt.room_id} by {evt.sender}
 {pluralize(count, "token")} needed, but only {tokens} remaining"""
         )
         return False
@@ -196,11 +212,12 @@ class SadPanda(Plugin):
 
         evt.content.trim_reply_fallback()
         gid_dict, page_list = get_gids(evt.content.body)
+        if not gid_dict:
+            return
         gallery_count = len(gid_dict)
         api_req_count = 2 if page_list else 1
         if not self.ratelimit_ok(evt, gallery_count, api_req_count):
             return
-
         gid_list = await resolve_page_gids(self, gid_dict, page_list)
         galleries = await gallery_api(self, gid_list)
         if not galleries:
@@ -215,10 +232,9 @@ class SadPanda(Plugin):
             tasks.append(self.get_thumb(gallery))
 
         thumbs = await asyncio.gather(*tasks)
-        collapsed = repeat(gallery_count > 1)
+        collapsed = repeat(gallery_count >= self.config["collapse_thresh"])
 
-        # Respond to messages with 3+ galleries in collapsed form with inlined thumbs regardless of setting to prevent spam.
-        if self.config["inline_thumbs"] or gallery_count > 2:
+        if gallery_count >= self.config["inline_thresh"]:
             body = "".join(map(format_msg, galleries, thumbs, collapsed))
             await evt.respond(body, allow_html=True)
         else:

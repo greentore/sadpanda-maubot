@@ -8,4 +8,5 @@ class Config(BaseProxyConfig):
         helper.copy("ratelimit.room.per_second")
         helper.copy("ratelimit.room.burst_count")
         helper.copy("blacklist")
-        helper.copy("inline_thumbs")
+        helper.copy("inline_thresh")
+        helper.copy("collapse_thresh")
